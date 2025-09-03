@@ -1,2 +1,6 @@
 streamlit
 pandas
+requests
+beautifulsoup4
+google-play-scraper
+rapidfuzz
