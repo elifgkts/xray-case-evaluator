@@ -1,6 +1,6 @@
- streamlit
-  pandas
-  requests
-  beautifulsoup4
-  google-play-scraper
-  rapidfuzz
+streamlit>=1.33
+pandas>=2.0
+requests>=2.31
+beautifulsoup4>=4.12.2
+google-play-scraper==1.2.3
+rapidfuzz>=3.5.2
