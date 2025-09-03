@@ -259,9 +259,31 @@ else:
 
 # Hedef ortam çıkarımı
 env_series = df.apply(lambda r: infer_target_env(r.get(col_platform), r.get(col_comp)), axis=1)
-work = df[[col_key, col_sum, col_comp, col_platform]].copy()
+
+# Yalnızca var olan kolonları seç
+selected_cols = [c for c in [col_key, col_sum, col_comp, col_platform] if c]
+work = df[selected_cols].copy()
+
+# Güvenli yeniden adlandırma
+rename_map = {}
+if col_key:      rename_map[col_key] = "Issue key"
+if col_sum:      rename_map[col_sum] = "Summary"
+if col_comp:     rename_map[col_comp] = "Component/s"
+if col_platform: rename_map[col_platform] = "Platform"
+work = work.rename(columns=rename_map)
+
+# Eksikse boş kolon ekle (UI için)
+for must in ["Issue key", "Summary"]:
+    if must not in work.columns:
+        work[must] = ""
+
+for opt in ["Component/s", "Platform"]:
+    if opt not in work.columns:
+        work[opt] = ""
+
+# Target Env’i 3. kolona ekle
 work.insert(2, "Target Env", env_series)
-work = work.rename(columns={col_key: "Issue key", col_sum: "Summary", col_comp: "Component/s", col_platform: "Platform"})
+
 
 st.subheader("Örneklem ve Hedef Ortam (düzenlenebilir)")
 st.caption("Satır bazında 'Target Env' alanını değiştirebilirsiniz. Android/iOS için paket/ID boşsa, genel ayarlardaki değerler kullanılır.")
