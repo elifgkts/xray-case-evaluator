@@ -1,35 +1,59 @@
 # streamlit_app.py
 # -*- coding: utf-8 -*-
 """
-Streamlit – Xray Case Evaluator 
+Streamlit – Xray Case Freshness (Store/Web Compare)
 
 Amaç
-- Jira/Xray CSV (;) içinden rastgele case seçip güncellik durumunu (Evet/Hayır/Evet*) heuristik olarak değerlendirmek
-- Her case için "Environment" (Mobile/Web/Backend/Unknown) tespiti + kullanıcı tarafından düzeltilebilir olması
-- Bu koşuda kontrolün hangi ortamda yapıldığını ayrıca kayıt etmek ("Checked On")
+- Jira/Xray CSV (;) içinden seçilen test caseleri **güncel ürün sayfalarıyla** karşılaştırarak
+  ilgili özelliğin hâlâ var olup olmadığına dair bir sinyal üretir.
+- Karşılaştırma kaynakları:
+  1) Web site içerik(leri) (örn. https://fizy.com ...)
+  2) Google Play (paket adı ile)
+  3) Apple App Store (app id ile; iTunes lookup API)
+
+Kurulum
+  pip install streamlit pandas requests beautifulsoup4 google-play-scraper rapidfuzz
 
 Çalıştırma
   streamlit run streamlit_app.py
 
-Gereksinimler
-  pip install streamlit pandas
-
 Notlar
-- Bu araç **step parser** değildir; ayrı bir uygulama olarak tasarlanmıştır.
-- Heuristik kararlar QA gözden geçirmesi ile doğrulanmalıdır.
+- Bu araç gerçek UI/functional test yapmaz; **public metadata** (açıklamalar, "Yenilikler", sayfa metinleri)
+  üzerinden kelime ve yakın eşleşme (fuzzy) ile sinyal üretir.
+- Son karar yine QA doğrulaması gerektirir.
 """
 
-from datetime import datetime
+from __future__ import annotations
+
 import json
 import re
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import pandas as pd
+import requests
 import streamlit as st
+from bs4 import BeautifulSoup
+from rapidfuzz import fuzz, process
+
+try:
+    # PyPI: google-play-scraper; module: google_play_scraper
+    from google_play_scraper import app as gp_app
+except Exception:
+    gp_app = None  # graceful fallback
 
 # ---------------------------
 # Yardımcılar
 # ---------------------------
+
+STOPWORDS_TR = set("""
+ve veya ile için gibi mı mi mu mü de da ki bu şu o bir birden daha çok çokça hemen artık yeni eski
+hakkında üzerine kadar sonra önce şu an anlık tüm tümü genel sadece özel
+""".split())
+
+RED_FLAGS = ["deprecated", "kaldırıldı", "artık yok", "kaldırıl", "deaktif", "pasif", "legacy", "eski ekran"]
+
 
 def find_col(cols: List[str], needle: str) -> str:
     low = needle.lower()
@@ -39,108 +63,131 @@ def find_col(cols: List[str], needle: str) -> str:
     return ""
 
 
-def parse_date_any(s: Optional[str]) -> Optional[datetime]:
-    if not isinstance(s, str) or not s.strip():
+def tokenize(s: str) -> List[str]:
+    s = re.sub(r"[^\wçğıöşüÇĞİÖŞÜ ]+", " ", s.lower(), flags=re.UNICODE)
+    toks = [t for t in s.split() if t and t not in STOPWORDS_TR and len(t) > 2]
+    return toks
+
+
+def extract_keywords(summary: str, extra_terms: List[str] | None = None) -> List[str]:
+    toks = tokenize(summary)
+    if extra_terms:
+        toks += [t.lower() for t in extra_terms if t]
+    # benzersiz sırayı koru
+    seen, out = set(), []
+    for t in toks:
+        if t not in seen:
+            seen.add(t); out.append(t)
+    return out[:20]  # aşırı genişlemeyi engelle
+
+# ------------- Kaynaklar -------------
+
+@dataclass
+class SourceText:
+    name: str
+    where: str  # web/appstore/play
+    text: str
+    url: Optional[str] = None
+
+
+def fetch_web_text(url: str, timeout: int = 15) -> SourceText:
+    r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    # görünür metinleri topla
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+    host = urlparse(url).netloc
+    return SourceText(name=f"Web:{host}", where="web", text=text[:40000], url=url)
+
+
+def fetch_play(package: str, lang: str = "tr", country: str = "tr") -> Optional[SourceText]:
+    if gp_app is None:
         return None
-    fmts = ["%d-%b-%y", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"]
-    for f in fmts:
-        try:
-            return datetime.strptime(s[:len(f)], f)
-        except Exception:
-            continue
     try:
-        dt = pd.to_datetime(s, errors="coerce")
-        return None if pd.isna(dt) else dt.to_pydatetime()
+        data = gp_app(package, lang=lang, country=country)
+        desc = (data.get("description") or "")
+        changes = (data.get("recentChanges") or "")
+        body = f"{desc}\n\nYenilikler:\n{changes}"
+        return SourceText(name="Google Play", where="play", text=body[:40000], url=f"https://play.google.com/store/apps/details?id={package}")
     except Exception:
         return None
 
 
-def months_diff(d1: datetime, d2: datetime) -> int:
-    return (d1.year - d2.year) * 12 + (d1.month - d2.month)
-
-
-# Basit ortam çıkarımı (kullanıcı sonradan düzenleyebilir)
-
-def infer_environment(project: Optional[str], labels: Optional[str], components: Optional[str]) -> str:
-    p = (project or "").lower()
-    l = (labels or "").lower()
-    c = (components or "").lower()
-    text = f"{p} {l} {c}"
-    if any(k in text for k in ["mobil", "mobile", "android", "ios"]):
-        return "Mobile"
-    if any(k in text for k in ["web", "frontend", "fe", "ui-web"]):
-        return "Web"
-    if any(k in text for k in ["backend", "server", "api", "db", "oracle"]):
-        return "Backend"
-    return "Unknown"
-
-
-# Heuristik karar kuralları
-RED_FLAGS = [
-    "deprecated", "kaldırıldı", "legacy", "artık yok", "deaktif", "pasif", "eski ekran", "v2 kapandı"
-]
-
-
-def has_any_expected(steps_cell: Optional[str]) -> bool:
-    if not isinstance(steps_cell, str) or not steps_cell.strip():
-        return False
-    # Basit kontrol: JSON parse etmeyi dener; olmazsa string içinde anahtar arar
+def fetch_appstore(app_id: str, country: str = "tr") -> Optional[SourceText]:
+    # iTunes lookup API
     try:
-        arr = json.loads(steps_cell.strip())
-        if isinstance(arr, list):
-            for it in arr:
-                fields = it.get("fields", {}) if isinstance(it, dict) else {}
-                if (fields.get("Expected Result") or "").strip():
-                    return True
+        r = requests.get("https://itunes.apple.com/lookup", params={"id": app_id, "country": country}, timeout=15)
+        r.raise_for_status()
+        js = r.json()
+        if js.get("resultCount", 0) > 0:
+            it = js["results"][0]
+            body = f"{it.get('description','')}\n\nYenilikler:\n{it.get('releaseNotes','')}"
+            return SourceText(name="App Store", where="appstore", text=body[:40000], url=it.get("trackViewUrl"))
     except Exception:
-        return "Expected Result" in steps_cell
-    return False
+        return None
+    return None
+
+# ------------- Eşleşme Skoru -------------
+
+@dataclass
+class MatchResult:
+    present: bool
+    score: int
+    top_hits: List[Tuple[str, int]]  # (keyword, score)
+    redflags: List[str]
+    evidence: Optional[str]
+    source: str
+    url: Optional[str]
 
 
-def evaluate_case(summary: str, steps: Optional[str], created: Optional[str]) -> Tuple[str, str]:
-    text_low = (summary or "").lower()
-    created_dt = parse_date_any(created)
-    now = datetime.now()
-    score = 0
-    reasons: List[str] = []
+def score_against_source(keywords: List[str], source: SourceText, threshold: int = 70) -> MatchResult:
+    # fuzzy: her anahtar için token_set_ratio ile en iyi eşleşmeyi ölç
+    hits: List[Tuple[str, int]] = []
+    for kw in keywords:
+        sc = fuzz.token_set_ratio(kw, source.text)
+        if sc >= 40:  # düşük eşikler de raporlansın
+            hits.append((kw, int(sc)))
+    hits.sort(key=lambda x: x[1], reverse=True)
+    present = any(sc >= threshold for _, sc in hits)
 
-    # Tarih
-    if created_dt:
-        m = months_diff(now, created_dt)
-        if m <= 18:
-            score += 2; reasons.append(f"Tarih yeni (~{m} ay)")
-        elif m >= 36:
-            score -= 2; reasons.append(f"Tarih eski (~{m} ay)")
+    # red flags
+    reds = [rf for rf in RED_FLAGS if rf in source.text.lower()]
 
-    # Red-flag
-    if any(flag in text_low for flag in RED_FLAGS):
-        score -= 3; reasons.append("Metinde deprecated/kaldırıldı vb.")
+    # küçük bir kanıt snippet'i
+    snippet = None
+    if hits:
+        best_kw, _ = hits[0]
+        # ilk eşleşen segmenti çek
+        m = re.search(re.escape(best_kw), source.text, re.IGNORECASE)
+        if m:
+            start = max(0, m.start() - 120)
+            end = min(len(source.text), m.end() + 180)
+            snippet = source.text[start:end]
 
-    # Expected Result
-    if has_any_expected(steps):
-        score += 1; reasons.append("Expected Result var")
-
-    decision = "Evet" if score > 0 else ("Hayır" if score < 0 else "Evet*")
-    return decision, "; ".join(reasons)
-
-
-def df_to_csv_bom(df: pd.DataFrame, sep: str = ";") -> bytes:
-    s = df.to_csv(index=False, sep=sep, encoding="utf-8-sig")
-    return s.encode("utf-8-sig")
+    return MatchResult(present=present, score=hits[0][1] if hits else 0, top_hits=hits[:5], redflags=reds, evidence=snippet, source=source.name, url=source.url)
 
 
 # ---------------------------
 # UI
 # ---------------------------
 
-st.set_page_config(page_title="Xray Case Evaluator", page_icon="✅", layout="wide")
-st.title("Xray Case Evaluator")
-st.caption("CSV → Rastgele senaryo seçimi + Güncellik değerlendirmesi; ortam belirleme ve raporlama")
+st.set_page_config(page_title="Xray Case Freshness – Store/Web Compare", page_icon="🔎", layout="wide")
+st.title("🔎 Xray Case Freshness – Store/Web Compare")
+st.caption("CSV → Seçili caseleri Web / Play Store / App Store açıklamalarıyla karşılaştırarak güncellik sinyali üretir.")
 
-uploaded = st.file_uploader("CSV yükle (Jira/Xray export, ; ile ayrılmış)", type=["csv"]) 
+uploaded = st.file_uploader("CSV yükle (Jira/Xray export; ; ile ayrılmış)", type=["csv"]) 
+
+with st.expander("Kaynak ayarları"):
+    web_urls = st.text_area("Web URL listesi (satır başına bir adres)", value="https://fizy.com\nhttps://fizy.com/kampanyalar")
+    pkg_android = st.text_input("Google Play paket adı (ör. com.turkcell.bip gibi)", value="")
+    appstore_id = st.text_input("App Store App ID (sayısal)", value="")
+    lang_country = st.selectbox("Dil/Ülke (Play & App Store)", ["tr/TR", "en/US"], index=0)
+    thr = st.slider("Eşleşme eşiği (fuzzy)", min_value=60, max_value=90, value=70, step=1)
 
 if uploaded is None:
-    st.info("CSV yükleyin. Gerekli sütunlar: Issue key/Key, Summary, Created, Project/Project name; opsiyonel: Labels, Components, Manual Test Steps")
+    st.info("CSV yükleyin. Gerekli sütunlar: Issue key/Key, Summary. Opsiyonel: Manual Test Steps, Project/Labels/Components.")
     st.stop()
 
 # CSV oku
@@ -149,92 +196,116 @@ try:
 except Exception:
     df_raw = pd.read_csv(uploaded, dtype=str, low_memory=False)
 
-# Sütun tespiti
-col_key   = find_col(df_raw.columns.tolist(), "Issue key") or find_col(df_raw.columns.tolist(), "Key")
-col_sum   = find_col(df_raw.columns.tolist(), "Summary")
-col_steps = find_col(df_raw.columns.tolist(), "Manual Test Steps")
-col_created = find_col(df_raw.columns.tolist(), "Created")
-col_proj  = find_col(df_raw.columns.tolist(), "Project name") or find_col(df_raw.columns.tolist(), "Project")
-col_labels= find_col(df_raw.columns.tolist(), "Labels")
-col_comp  = find_col(df_raw.columns.tolist(), "Components")
-
-missing = []
-for name, col in [("Issue key", col_key), ("Summary", col_sum), ("Created", col_created), ("Project/Project name", col_proj)]:
-    if not col: missing.append(name)
-if missing:
-    st.error("Eksik sütun(lar): " + ", ".join(missing))
+col_key = find_col(df_raw.columns.tolist(), "Issue key") or find_col(df_raw.columns.tolist(), "Key")
+col_sum = find_col(df_raw.columns.tolist(), "Summary")
+if not col_key or not col_sum:
+    st.error("Issue key/Key ve Summary sütunları gerekli.")
     st.stop()
 
-st.success(f"Yüklendi: {len(df_raw)} satır, {len(df_raw.columns)} sütun")
-
-# ---- Kontrol paneli
-c1, c2, c3 = st.columns([1,1,1])
+# Örneklem kontrolleri
+c1, c2 = st.columns(2)
 with c1:
-    sample_n = st.number_input("Rastgele örnek sayısı", min_value=1, max_value=max(1, len(df_raw)), value=min(10, len(df_raw)), step=1)
+    sample_n = st.number_input("Örneklem (adet)", min_value=1, max_value=max(1, len(df_raw)), value=min(10, len(df_raw)), step=1)
 with c2:
-    rng_seed = st.number_input("Rastgele tohum (seed)", min_value=0, max_value=10000, value=42, step=1)
-with c3:
-    default_checked_env = st.selectbox("Bu koşuda kontrol edilen ortam (default)", ["Mobile","Web","Backend","Unknown"], index=1)
+    seed = st.number_input("Rastgele seed", min_value=0, max_value=99999, value=42, step=1)
 
-# Ortam çıkarımı + örneklem
-env_series = df_raw.apply(lambda r: infer_environment(r.get(col_proj), r.get(col_labels), r.get(col_comp)), axis=1)
-work = df_raw.copy()
-work.insert(2, "Environment", env_series)
-work.insert(3, "Checked On", default_checked_env)
+if len(df_raw) > sample_n:
+    df = df_raw.sample(n=int(sample_n), random_state=int(seed))
+else:
+    df = df_raw.copy()
 
-# Rastgele seç
-if len(work) > sample_n:
-    work = work.sample(n=int(sample_n), random_state=int(rng_seed))
+# Kaynakları getir
+lang, country = lang_country.split("/")
 
-# Kullanıcıya ortam düzeltmeleri için editör
-st.subheader("Örneklem ve Ortam Düzeltmeleri")
-st.caption("Gerekiyorsa Environment/Checked On kolonlarını değiştirin. Sonraki adımda değerlendirme yapılır.")
+sources: List[SourceText] = []
+# Web
+urls = [u.strip() for u in web_urls.splitlines() if u.strip()]
+for url in urls:
+    try:
+        sources.append(fetch_web_text(url))
+    except Exception as e:
+        st.warning(f"Web kaynağı alınamadı: {url} → {e}")
 
-edited = st.data_editor(
-    work[[col_key, col_sum, col_proj, "Environment", "Checked On", col_created, col_steps]].rename(columns={
-        col_key: "Issue key", col_sum: "Summary", col_proj: "Project", col_created: "Created", col_steps: "Manual Test Steps"
-    }),
-    column_config={
-        "Environment": st.column_config.SelectboxColumn(options=["Mobile","Web","Backend","Unknown"], help="Case'in ait olduğu ortam"),
-        "Checked On": st.column_config.SelectboxColumn(options=["Mobile","Web","Backend","Unknown"], help="Bu koşuda kontrolü yaptığınız ortam"),
-        "Manual Test Steps": st.column_config.TextColumn(help="Opsiyonel. JSON ham içerik veya boş.")
-    },
-    use_container_width=True,
-    num_rows="fixed"
-)
+# Play
+if pkg_android:
+    st.caption(":information_source: Google Play içeriği (paket adı gerek): description + recentChanges")
+    src = fetch_play(pkg_android, lang=lang, country=country)
+    if src:
+        sources.append(src)
+    else:
+        st.warning("Google Play verisi alınamadı veya paket geçersiz.")
 
-# Değerlendirme
-results: List[Dict[str, Any]] = []
-for _, row in edited.iterrows():
-    decision, reason = evaluate_case(row.get("Summary"), row.get("Manual Test Steps"), row.get("Created"))
-    results.append({
-        "Issue key": row.get("Issue key"),
-        "Summary": row.get("Summary"),
-        "Project": row.get("Project"),
-        "Environment": row.get("Environment"),
-        "Checked On": row.get("Checked On"),
-        "Created": row.get("Created"),
-        "Evaluation": decision,
-        "Reason": reason,
+# App Store
+if appstore_id:
+    st.caption(":information_source: App Store içeriği (App ID gerek): description + releaseNotes")
+    src = fetch_appstore(appstore_id, country=country)
+    if src:
+        sources.append(src)
+    else:
+        st.warning("App Store verisi alınamadı veya App ID geçersiz.")
+
+if not sources:
+    st.error("Hiç kaynak alınamadı. En az bir web adresi veya mağaza kimliği giriniz.")
+    st.stop()
+
+# Eşle ve karar ver
+rows: List[Dict[str, Any]] = []
+for _, r in df.iterrows():
+    key = r.get(col_key)
+    summary = r.get(col_sum) or ""
+    kws = extract_keywords(summary)
+    match_details: List[Dict[str, Any]] = []
+    any_present = False
+    any_red = False
+
+    for src in sources:
+        mr = score_against_source(kws, src, threshold=int(thr))
+        any_present = any_present or mr.present
+        any_red = any_red or bool(mr.redflags)
+        match_details.append({
+            "Source": mr.source,
+            "URL": mr.url or "",
+            "Present": "Evet" if mr.present else "Belirsiz",
+            "Score": mr.score,
+            "Top hits": ", ".join([f"{w}:{s}" for w,s in mr.top_hits]),
+            "Red flags": ", ".join(mr.redflags),
+            "Evidence": (mr.evidence or "")[:300]
+        })
+
+    # Karar mantığı
+    if any_present and not any_red:
+        evaluation = "Evet"
+    elif any_red and not any_present:
+        evaluation = "Hayır"
+    else:
+        evaluation = "Evet*"  # sinyaller karışık veya yetersiz
+
+    rows.append({
+        "Issue key": key,
+        "Summary": summary,
+        "Evaluation": evaluation,
+        "Details": json.dumps(match_details, ensure_ascii=False)
     })
 
-out = pd.DataFrame(results)
+out = pd.DataFrame(rows)
 
-# KPI'lar
-k1, k2, k3, k4 = st.columns(4)
-with k1: st.metric("Örneklem", len(out))
-with k2: st.metric("Evet", int((out["Evaluation"] == "Evet").sum()))
-with k3: st.metric("Evet*", int((out["Evaluation"] == "Evet*").sum()))
-with k4: st.metric("Hayır", int((out["Evaluation"] == "Hayır").sum()))
+st.subheader("Sonuçlar")
+st.dataframe(out[["Issue key","Summary","Evaluation"]], use_container_width=True)
 
-st.subheader("Değerlendirme Sonuçları")
-st.dataframe(out, use_container_width=True)
+with st.expander("Kaynak eşleşme detayları"):
+    st.dataframe(out[["Issue key","Details"]], use_container_width=True)
+
+# İndirme
+
+def df_to_csv_bom(df: pd.DataFrame, sep: str = ";") -> bytes:
+    s = df.to_csv(index=False, sep=sep, encoding="utf-8-sig")
+    return s.encode("utf-8-sig")
 
 st.download_button(
     label="CSV indir (UTF-8 BOM, ;)",
     data=df_to_csv_bom(out, sep=";"),
-    file_name="case_evaluation_sample.csv",
+    file_name="store_web_compare_results.csv",
     mime="text/csv",
 )
 
-st.caption("Not: Heuristik kararlar yönlendiricidir; kesin doğrulama için ilgili ortamdaki gerçek uygulamada manuel test önerilir.")
+st.caption("Not: Bu yöntem store/web açıklamalarına dayanır; tüm özellikleri listelemeyebilir. Son karar için uygulama içi test önerilir.")
