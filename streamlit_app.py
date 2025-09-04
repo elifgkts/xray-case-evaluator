@@ -2,18 +2,12 @@
 """
 Xray Case Freshness – Environment-Aware (Store/Web Compare)
 
-Ne yapar?
-- CSV (;) içinden caseleri alır.
-- Hedef ortamı (Android / iOS / Web / Mobile / Backend / Unknown) Platform + Component/s kolonlarından çıkarır
-  (gerekirse tabloda satır satır düzeltebilirsin).
-- Yalnızca o ortama uygun kaynaklarda arar:
-    Android  → Google Play (description + recentChanges)
-    iOS      → App Store (description + releaseNotes)
-    Web      → Verdiğin web URL’leri (metin içerik)
-    Mobile   → Play + App Store (ikisi de girilmişse)
-    Backend  → Web URL’leri (örn. dokümantasyon linkleri girilebilir)
-- Summary’den anahtar kelimeler çıkarır, fuzzy (bulanık) karşılaştırma yapar.
-- Sonuç: Evet / Hayır / Evet* + kısa Reason + kaynak bazlı detay (JSON).
+Yenilikler:
+- Issue key ipucu: QF* → Web, QB* → Backend (öncelikli kural)
+- Google Play paket adı ve App Store App ID alanları artık dropdown:
+    • Google Play default: com.turkcell.gncplay
+    • App Store default : 404239912
+- Diğer uygulamaların paket/ID’leri ileride kolayca listeye eklenebilir.
 
 Not:
 - Bu bir fonksiyonel test değildir; public metinlerden sinyal üretir. QA doğrulaması tavsiye edilir.
@@ -188,8 +182,16 @@ def score_against_source(keywords: List[str], source: SourceText, threshold: int
     )
 
 # ------------- Ortam çıkarımı -------------
+def infer_target_env(platform_val: str | None, components_val: str | None, issue_key: str | None = "") -> str:
+    # 1) Issue key ipuçları (öncelikli)
+    if issue_key:
+        s = str(issue_key)
+        if s.startswith("QF"):
+            return "Web"
+        if s.startswith("QB"):
+            return "Backend"
 
-def infer_target_env(platform_val: str | None, components_val: str | None) -> str:
+    # 2) Platform/Component metinleri
     p = (platform_val or "").lower()
     c = (components_val or "").lower()
     text = f"{p} {c}"
@@ -218,8 +220,21 @@ uploaded = st.file_uploader("CSV yükle (Jira/Xray export; ; ile ayrılmış)", 
 with st.expander("Kaynak & Parametre Ayarları"):
     web_urls = st.text_area("Web URL listesi (satır başına bir adres)",
                             value="https://fizy.com\nhttps://fizy.com/kampanyalar")
-    pkg_android_default = st.text_input("Google Play paket adı (örn. com.turkcell.gncplay)", value="")
-    appstore_id_default = st.text_input("App Store App ID (sayısal)", value="")
+
+    # --- Dropdown listeler (şimdilik Fizy varsayılanları + 'Manuel giriş') ---
+    PLAY_OPTIONS = ["com.turkcell.gncplay", "Manuel giriş"]
+    APPSTORE_OPTIONS = ["404239912", "Manuel giriş"]
+
+    pkg_choice = st.selectbox("Google Play paket adı", options=PLAY_OPTIONS, index=0)
+    appid_choice = st.selectbox("App Store App ID", options=APPSTORE_OPTIONS, index=0)
+
+    pkg_android_default = st.text_input("Paket adı (manuel)", value="", disabled=(pkg_choice != "Manuel giriş"))
+    appstore_id_default = st.text_input("App ID (manuel)", value="", disabled=(appid_choice != "Manuel giriş"))
+
+    # Seçime göre efektif değerleri belirle
+    effective_pkg = pkg_android_default if pkg_choice == "Manuel giriş" else pkg_choice
+    effective_appid = appstore_id_default if appid_choice == "Manuel giriş" else appid_choice
+
     lang_country = st.selectbox("Dil/Ülke (Play & App Store)", ["tr/TR", "en/US"], index=0)
     thr = st.slider("Eşleşme eşiği (fuzzy)", min_value=60, max_value=90, value=70, step=1)
     use_all_rows = st.toggle("Tüm satırlarda çalıştır (işaretli değilse rastgele örneklem)")
@@ -272,8 +287,8 @@ if use_all_rows:
 else:
     df = df_raw.sample(n=int(sample_n), random_state=int(seed)) if len(df_raw) > sample_n else df_raw.copy()
 
-# Hedef ortam çıkarımı
-env_series = df.apply(lambda r: infer_target_env(r.get(col_platform), r.get(col_comp)), axis=1)
+# Hedef ortam çıkarımı (QF/QB ipucuyla)
+env_series = df.apply(lambda r: infer_target_env(r.get(col_platform), r.get(col_comp), r.get(col_key)), axis=1)
 
 # Yalnızca var olan kolonları seç
 selected_cols = [c for c in [col_key, col_sum, col_comp, col_platform] if c]
@@ -300,7 +315,7 @@ for opt in ["Component/s", "Platform"]:
 work.insert(2, "Target Env", env_series)
 
 st.subheader("Örneklem ve Hedef Ortam (düzenlenebilir)")
-st.caption("Satır bazında 'Target Env' alanını değiştirebilirsiniz. Android/iOS için paket/ID boşsa, genel ayarlardaki değerler kullanılır.")
+st.caption("Satır bazında 'Target Env' alanını değiştirebilirsiniz. Android/iOS için paket/ID boşsa, dropdown seçimi kullanılır.")
 
 edited = st.data_editor(
     work,
@@ -340,13 +355,13 @@ for _, r in edited.iterrows():
                 pass
 
     # Android
-    if target in ("Android", "Mobile") and pkg_android_default:
-        src = fetch_play(pkg_android_default, lang=lang, country=country)
+    if target in ("Android", "Mobile") and effective_pkg:
+        src = fetch_play(effective_pkg, lang=lang, country=country)
         if src: sources.append(src)
 
     # iOS
-    if target in ("iOS", "Mobile") and appstore_id_default:
-        src = fetch_appstore(appstore_id_default, country=country)
+    if target in ("iOS", "Mobile") and effective_appid:
+        src = fetch_appstore(effective_appid, country=country)
         if src: sources.append(src)
 
     if not sources:
@@ -355,7 +370,7 @@ for _, r in edited.iterrows():
             "Summary": summary,
             "Target Env": target,
             "Evaluation": "Evet*",
-            "Reason": "Kaynak yok (URL/paket/ID giriniz)",
+            "Reason": "Kaynak yok (URL/paket/ID giriniz veya dropdown seçiniz)",
             "Details": json.dumps([], ensure_ascii=False)
         })
         continue
@@ -417,4 +432,4 @@ st.download_button(
     mime="text/csv",
 )
 
-st.caption("Not: Eksik paket/ID veya kütüphane durumunda uygulama uyarı verip kalan kaynaklarla çalışır.")
+st.caption("Not: Eksik kütüphane/paket/ID durumunda uygulama uyarı verip kalan kaynaklarla çalışır.")
