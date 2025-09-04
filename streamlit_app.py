@@ -228,17 +228,32 @@ if uploaded is None:
     st.info("CSV yükleyin. Gerekli sütunlar: Issue key/Key, Summary. Ortam çıkarımı için: Component/s ve/veya Custom field (Platform).")
     st.stop()
 
-# CSV oku
+# CSV oku (başlıkları temizle, NA'yı devre dışı bırak)
 try:
-    df_raw = pd.read_csv(uploaded, sep=";", dtype=str, low_memory=False)
+    df_raw = pd.read_csv(uploaded, sep=";", dtype=str, low_memory=False, na_filter=False)
 except Exception:
-    df_raw = pd.read_csv(uploaded, dtype=str, low_memory=False)
+    df_raw = pd.read_csv(uploaded, dtype=str, low_memory=False, na_filter=False)
+df_raw.columns = [c.strip() for c in df_raw.columns]
 
-# Sütun tespiti
+# Sütun tespiti (otomatik)
 col_key = find_col(df_raw.columns.tolist(), "Issue key") or find_col(df_raw.columns.tolist(), "Key")
 col_sum = find_col(df_raw.columns.tolist(), "Summary")
 col_comp = find_col(df_raw.columns.tolist(), "Component/s") or find_col(df_raw.columns.tolist(), "Components")
 col_platform = find_col(df_raw.columns.tolist(), "Custom field (Platform)") or find_col(df_raw.columns.tolist(), "Platform")
+
+# Manuel eşleştirme (opsiyonel)
+with st.expander("Sütun eşlemesi (manuel override)"):
+    all_cols = list(df_raw.columns)
+    col_key = st.selectbox("Issue key kolonu", options=all_cols, index=all_cols.index(col_key) if col_key else 0)
+    col_sum = st.selectbox("Summary kolonu", options=all_cols, index=all_cols.index(col_sum) if col_sum else 0)
+    col_comp_sel = ["<yok>"] + all_cols
+    col_platform_sel = ["<yok>"] + all_cols
+    comp_choice = st.selectbox("Component/s kolonu", options=col_comp_sel,
+                               index=(all_cols.index(col_comp)+1) if col_comp else 0)
+    plat_choice = st.selectbox("Platform kolonu", options=col_platform_sel,
+                               index=(all_cols.index(col_platform)+1) if col_platform else 0)
+    col_comp = None if comp_choice == "<yok>" else comp_choice
+    col_platform = None if plat_choice == "<yok>" else plat_choice
 
 if not col_key or not col_sum:
     st.error("Issue key/Key ve Summary sütunları zorunlu.")
@@ -284,7 +299,6 @@ for opt in ["Component/s", "Platform"]:
 # Target Env’i 3. kolona ekle
 work.insert(2, "Target Env", env_series)
 
-
 st.subheader("Örneklem ve Hedef Ortam (düzenlenebilir)")
 st.caption("Satır bazında 'Target Env' alanını değiştirebilirsiniz. Android/iOS için paket/ID boşsa, genel ayarlardaki değerler kullanılır.")
 
@@ -300,8 +314,14 @@ edited = st.data_editor(
 )
 
 # Kaynak & dil
-lang, country = lang_country.split("/")
-web_list = [u.strip() for u in web_urls.splitlines() if u.strip()]
+with st.expander("Kaynaklar durumu"):
+    st.write({
+        "Google Play modülü": "OK" if gp_app else "YOK (atlanır)",
+        "BeautifulSoup": "OK" if HAVE_BS4 else "YOK (regex fallback)",
+    })
+
+lang, country = (lang_country or "tr/TR").split("/")
+web_list = [u.strip() for u in (web_urls or "").splitlines() if u.strip()]
 
 # Eşleştirme – satır bazında yalnızca ilgili kaynaklarda
 rows: List[Dict[str, Any]] = []
