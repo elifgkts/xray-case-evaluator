@@ -219,7 +219,7 @@ with st.expander("Ürün seçimi ve presetler"):
         "Özel (manuel)": {
             "play": ["Manuel giriş", "Yok (uygulanmaz)"],
             "ios": ["Manuel giriş", "Yok (uygulanmaz)"],
-        }
+        },
     }
 
     default_web_urls = PRESETS_WEB.get(product, "")
@@ -252,3 +252,197 @@ with st.expander("Kaynak & Parametre Ayarları"):
     lang_country = st.selectbox("Dil/Ülke (Play & App Store)", ["tr/TR", "en/US"], index=0)
     thr = st.slider("Eşleşme eşiği (fuzzy)", min_value=60, max_value=90, value=70, step=1)
     use_all_rows = st.toggle("Tüm satırlarda çalıştır (işaretli değilse rastgele örneklem)")
+
+if uploaded is None:
+    st.info("CSV yükleyin. Gerekli sütunlar: Issue key/Key, Summary. Ortam çıkarımı için: Component/s ve/veya Custom field (Platform).")
+    st.stop()
+
+# CSV oku (başlıkları temizle, NA'yı devre dışı bırak)
+try:
+    df_raw = pd.read_csv(uploaded, sep=";", dtype=str, low_memory=False, na_filter=False)
+except Exception:
+    df_raw = pd.read_csv(uploaded, dtype=str, low_memory=False, na_filter=False)
+
+df_raw.columns = [c.strip() for c in df_raw.columns]
+
+# Sütun tespiti (otomatik)
+col_key = find_col(df_raw.columns.tolist(), "Issue key") or find_col(df_raw.columns.tolist(), "Key")
+col_sum = find_col(df_raw.columns.tolist(), "Summary")
+col_comp = find_col(df_raw.columns.tolist(), "Component/s") or find_col(df_raw.columns.tolist(), "Components")
+col_platform = find_col(df_raw.columns.tolist(), "Custom field (Platform)") or find_col(df_raw.columns.tolist(), "Platform")
+
+# Manuel eşleştirme (opsiyonel)
+with st.expander("Sütun eşlemesi (manuel override)"):
+    all_cols = list(df_raw.columns)
+    col_key = st.selectbox("Issue key kolonu", options=all_cols, index=all_cols.index(col_key) if col_key else 0)
+    col_sum = st.selectbox("Summary kolonu", options=all_cols, index=all_cols.index(col_sum) if col_sum else 0)
+    col_comp_sel = ["<yok>"] + all_cols
+    col_platform_sel = ["<yok>"] + all_cols
+    comp_choice = st.selectbox("Component/s kolonu", options=col_comp_sel, index=(all_cols.index(col_comp)+1) if col_comp else 0)
+    plat_choice = st.selectbox("Platform kolonu", options=col_platform_sel, index=(all_cols.index(col_platform)+1) if col_platform else 0)
+    col_comp = None if comp_choice == "<yok>" else comp_choice
+    col_platform = None if plat_choice == "<yok>" else plat_choice
+
+if not col_key or not col_sum:
+    st.error("Issue key/Key ve Summary sütunları zorunlu.")
+    st.stop()
+
+# Örneklem
+c1, c2 = st.columns(2)
+with c1:
+    sample_n = st.number_input("Örneklem (adet)", min_value=1, max_value=max(1, len(df_raw)), value=min(10, len(df_raw)), step=1, disabled=use_all_rows)
+with c2:
+    seed = st.number_input("Rastgele seed", min_value=0, max_value=99999, value=42, step=1, disabled=use_all_rows)
+
+if use_all_rows:
+    df = df_raw.copy()
+else:
+    df = df_raw.sample(n=int(sample_n), random_state=int(seed)) if len(df_raw) > sample_n else df_raw.copy()
+
+# Hedef ortam çıkarımı (QF/QB ipucuyla)
+env_series = df.apply(lambda r: infer_target_env(r.get(col_platform), r.get(col_comp), r.get(col_key)), axis=1)
+
+# Yalnızca var olan kolonları seç
+selected_cols = [c for c in [col_key, col_sum, col_comp, col_platform] if c]
+work = df[selected_cols].copy()
+
+# Güvenli yeniden adlandırma
+rename_map = {}
+if col_key:      rename_map[col_key] = "Issue key"
+if col_sum:      rename_map[col_sum] = "Summary"
+if col_comp:     rename_map[col_comp] = "Component/s"
+if col_platform: rename_map[col_platform] = "Platform"
+work = work.rename(columns=rename_map)
+
+# Eksikse boş kolon ekle (UI için)
+for must in ["Issue key", "Summary"]:
+    if must not in work.columns:
+        work[must] = ""
+
+for opt in ["Component/s", "Platform"]:
+    if opt not in work.columns:
+        work[opt] = ""
+
+# Target Env’i 3. kolona ekle
+work.insert(2, "Target Env", env_series)
+
+st.subheader("Örneklem ve Hedef Ortam (düzenlenebilir)")
+st.caption("Satır bazında 'Target Env' alanını değiştirebilirsiniz. Android/iOS için paket/ID boşsa, ürün seçiminiz de 'Yok' ise store taraması yapılmaz.")
+
+edited = st.data_editor(
+    work,
+    column_config={
+        "Target Env": st.column_config.SelectboxColumn(options=["Android", "iOS", "Mobile", "Web", "Backend", "Unknown"], help="Bu case hangi ortamda doğrulanmalı?")
+    },
+    use_container_width=True,
+)
+
+# Kaynak & dil
+with st.expander("Kaynaklar durumu"):
+    st.write({
+        "Google Play modülü": "OK" if gp_app else "YOK (atlanır)",
+        "BeautifulSoup": "OK" if HAVE_BS4 else "YOK (regex fallback)",
+        "Ürün": product,
+    })
+
+lang, country = (lang_country or "tr/TR").split("/")
+web_list = [u.strip() for u in (web_urls or "").splitlines() if u.strip()]
+
+# Eşleştirme – satır bazında yalnızca ilgili kaynaklarda
+rows: List[Dict[str, Any]] = []
+for _, r in edited.iterrows():
+    key = r.get("Issue key")
+    summary = r.get("Summary") or ""
+    target = (r.get("Target Env") or "Unknown").strip()
+
+    sources: List[SourceText] = []
+    # Web (Web, Backend, Unknown, Mobile genel için isteğe bağlı)
+    if target in ("Web", "Backend", "Unknown", "Mobile"):
+        for url in web_list:
+            try:
+                sources.append(fetch_web_text(url))
+            except Exception:
+                pass
+
+    # Android
+    if target in ("Android", "Mobile") and effective_pkg:
+        src = fetch_play(effective_pkg, lang=lang, country=country)
+        if src:
+            sources.append(src)
+
+    # iOS
+    if target in ("iOS", "Mobile") and effective_appid:
+        src = fetch_appstore(effective_appid, country=country)
+        if src:
+            sources.append(src)
+
+    if not sources:
+        rows.append({
+            "Issue key": key,
+            "Summary": summary,
+            "Target Env": target,
+            "Evaluation": "Evet*",
+            "Reason": "Kaynak yok (URL/paket/ID giriniz veya ürün presetini kontrol ediniz)",
+            "Details": json.dumps([], ensure_ascii=False),
+        })
+        continue
+
+    kws = extract_keywords(summary)
+    any_present, any_red = False, False
+    match_details: List[Dict[str, Any]] = []
+    best_score = -1
+
+    for src in sources:
+        mr = score_against_source(kws, src, threshold=int(thr))
+        any_present = any_present or mr.present
+        any_red = any_red or bool(mr.redflags)
+        if mr.score > best_score:
+            best_score = mr.score
+        match_details.append({
+            "Source": mr.source,
+            "URL": mr.url or "",
+            "Present": "Evet" if mr.present else "Belirsiz",
+            "Score": mr.score,
+            "Top hits": ", ".join([f"{w}:{s}" for w, s in mr.top_hits]),
+            "Red flags": ", ".join(mr.redflags),
+            "Evidence": (mr.evidence or "")[:300],
+        })
+
+    if any_present and not any_red:
+        evaluation, reason = "Evet", f"Kaynakta güçlü eşleşme (best {best_score})"
+    elif any_red and not any_present:
+        evaluation, reason = "Hayır", "Red-flag bulundu; güçlü eşleşme yok"
+    else:
+        evaluation, reason = "Evet*", f"Karışık/zayıf sinyal (best {best_score})"
+
+    rows.append({
+        "Issue key": key,
+        "Summary": summary,
+        "Target Env": target,
+        "Evaluation": evaluation,
+        "Reason": reason,
+        "Details": json.dumps(match_details, ensure_ascii=False),
+    })
+
+out = pd.DataFrame(rows)
+
+# Görünüm + indirme
+st.subheader("Sonuçlar")
+st.dataframe(out[["Issue key", "Target Env", "Evaluation", "Reason"]], use_container_width=True)
+
+with st.expander("Kaynak eşleşme detayları"):
+    st.dataframe(out[["Issue key", "Details"]], use_container_width=True)
+
+
+def df_to_csv_bom(df: pd.DataFrame, sep: str = ";") -> bytes:
+    s = df.to_csv(index=False, sep=sep, encoding="utf-8-sig")
+    return s.encode("utf-8-sig")
+
+st.download_button(
+    label="CSV indir (UTF-8 BOM, ;)",
+    data=df_to_csv_bom(out, sep=";"),
+    file_name="env_aware_compare_results.csv",
+    mime="text/csv",
+)
+
+st.caption("Not: Ürün presetleri ile Game+ için store taraması otomatik devre dışı kalır; Web URL listesi üzerinden doğrulama yapılır. Eksik kütüphane/paket/ID durumunda uygulama uyarı verip kalan kaynaklarla çalışır.")
