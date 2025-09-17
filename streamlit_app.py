@@ -38,7 +38,6 @@ try:
     def FUZZ(a: str, b: str) -> int:
         return int(_rf_fuzz.token_set_ratio(a, b))
 except Exception:
-    # rapidfuzz yoksa difflib ile basit skor
     from difflib import SequenceMatcher
     def FUZZ(a: str, b: str) -> int:
         return int(100 * SequenceMatcher(None, a, b).ratio())
@@ -46,11 +45,7 @@ except Exception:
 try:
     from google_play_scraper import app as gp_app
 except Exception:
-    gp_app = None  # yoksa Play kaynağını atlarız
-
-# ---------------------------
-# Yardımcılar
-# ---------------------------
+    gp_app = None
 
 STOPWORDS_TR = set("""
 ve veya ile için gibi mı mi mu mü de da ki bu şu o bir birden daha çok çokça hemen artık yeni eski
@@ -86,18 +81,15 @@ def html_to_text(html: str) -> str:
         soup = BeautifulSoup(html, "html.parser")
         for tag in soup(["script","style","noscript"]): tag.decompose()
         return re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
-    # fallback: kaba temizleme
     txt = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.I)
     txt = re.sub(r"<style[\s\S]*?</style>", " ", txt, flags=re.I)
     txt = re.sub(r"<[^>]+>", " ", txt)
     return re.sub(r"\s+", " ", txt).strip()
 
-# ------------- Kaynak Okuyucular -------------
-
 @dataclass
 class SourceText:
     name: str
-    where: str   # web/play/appstore
+    where: str
     text: str
     url: Optional[str] = None
 
@@ -118,8 +110,7 @@ def fetch_play(package: str, lang: str = "tr", country: str = "tr") -> Optional[
         desc = (data.get("description") or "")
         changes = (data.get("recentChanges") or "")
         body = f"{desc}\n\nYenilikler:\n{changes}"
-        return SourceText(name="Google Play", where="play", text=body[:40000],
-                          url=f"https://play.google.com/store/apps/details?id={package}")
+        return SourceText(name="Google Play", where="play", text=body[:40000], url=f"https://play.google.com/store/apps/details?id={package}")
     except Exception:
         return None
 
@@ -128,20 +119,16 @@ def fetch_appstore(app_id: str, country: str = "tr") -> Optional[SourceText]:
     if not app_id:
         return None
     try:
-        r = requests.get("https://itunes.apple.com/lookup",
-                         params={"id": app_id, "country": country}, timeout=15)
+        r = requests.get("https://itunes.apple.com/lookup", params={"id": app_id, "country": country}, timeout=15)
         r.raise_for_status()
         js = r.json()
         if js.get("resultCount", 0) > 0:
             it = js["results"][0]
             body = f"{it.get('description','')}\n\nYenilikler:\n{it.get('releaseNotes','')}"
-            return SourceText(name="App Store", where="appstore", text=body[:40000],
-                              url=it.get("trackViewUrl"))
+            return SourceText(name="App Store", where="appstore", text=body[:40000], url=it.get("trackViewUrl"))
     except Exception:
         return None
     return None
-
-# ------------- Eşleştirme -------------
 
 @dataclass
 class MatchResult:
@@ -157,7 +144,7 @@ def score_against_source(keywords: List[str], source: SourceText, threshold: int
     hits: List[Tuple[str, int]] = []
     for kw in keywords:
         sc = FUZZ(kw, source.text)
-        if sc >= 40:  # düşük eşikler de raporlansın
+        if sc >= 40:
             hits.append((kw, int(sc)))
     hits.sort(key=lambda x: x[1], reverse=True)
     present = any(sc >= threshold for _, sc in hits)
@@ -182,18 +169,13 @@ def score_against_source(keywords: List[str], source: SourceText, threshold: int
         url=source.url
     )
 
-# ------------- Ortam çıkarımı -------------
-
 def infer_target_env(platform_val: str | None, components_val: str | None, issue_key: str | None = "") -> str:
-    # 1) Issue key ipuçları (öncelikli)
     if issue_key:
         s = str(issue_key)
         if s.startswith("QF"):
             return "Web"
         if s.startswith("QB"):
             return "Backend"
-
-    # 2) Platform/Component metinleri
     p = (platform_val or "").lower()
     c = (components_val or "").lower()
     text = f"{p} {c}"
@@ -209,34 +191,64 @@ def infer_target_env(platform_val: str | None, components_val: str | None, issue
         return "Backend"
     return "Unknown"
 
-# ---------------------------
-# UI
-# ---------------------------
-
 st.set_page_config(page_title="Xray Case Freshness – Env Aware", page_icon="🔎", layout="wide")
 st.title("🔎 Xray Case Freshness – Environment-Aware Compare")
 st.caption("CSV → Hedef ortama göre (Web/Play/App Store) karşılaştırma + fuzzy skor + kanıt")
 
 uploaded = st.file_uploader("CSV yükle (Jira/Xray export; ; ile ayrılmış)", type=["csv"])
 
-# --- Ürün seçici & presetler ---
 with st.expander("Ürün seçimi ve presetler"):
     PRODUCT_OPTIONS = ["Fizy", "Game+", "Özel (manuel)"]
-    product = st.selectbox("Ürün", options=PRODUCT_OPTIONS, index=0, help="Seçime göre web/store alanları otomatik dolar.")
+    product = st.selectbox("Ürün", options=PRODUCT_OPTIONS, index=0)
 
-    # Preset web URL listeleri
     PRESETS_WEB: Dict[str, str] = {
         "Fizy": "https://fizy.com\nhttps://fizy.com/kampanyalar",
         "Game+": "https://gameplus.com.tr\nhttps://gameplus.com.tr/blog\nhttps://gameplus.com.tr/firsatlar\nhttps://gameplus.com.tr/destek",
         "Özel (manuel)": "",
     }
 
-    # Preset store kimlikleri
     PRESETS_STORE: Dict[str, Dict[str, List[str]]] = {
         "Fizy": {
             "play": ["com.turkcell.gncplay", "Manuel giriş", "Yok (uygulanmaz)"],
             "ios": ["404239912", "Manuel giriş", "Yok (uygulanmaz)"],
         },
         "Game+": {
-            # Game+'ta mobil uygulama yok
             "play": ["Yok (uygulanmaz)", "Manuel giriş"],
+            "ios": ["Yok (uygulanmaz)", "Manuel giriş"],
+        },
+        "Özel (manuel)": {
+            "play": ["Manuel giriş", "Yok (uygulanmaz)"],
+            "ios": ["Manuel giriş", "Yok (uygulanmaz)"],
+        }
+    }
+
+    default_web_urls = PRESETS_WEB.get(product, "")
+
+with st.expander("Kaynak & Parametre Ayarları"):
+    web_urls = st.text_area("Web URL listesi (satır başına bir adres)", value=default_web_urls)
+
+    PLAY_OPTIONS = PRESETS_STORE[product]["play"]
+    APPSTORE_OPTIONS = PRESETS_STORE[product]["ios"]
+
+    pkg_choice = st.selectbox("Google Play paket adı", options=PLAY_OPTIONS, index=0)
+    appid_choice = st.selectbox("App Store App ID", options=APPSTORE_OPTIONS, index=0)
+
+    disable_pkg_manual = (pkg_choice != "Manuel giriş")
+    disable_app_manual = (appid_choice != "Manuel giriş")
+
+    pkg_android_default = st.text_input("Paket adı (manuel)", value="", disabled=disable_pkg_manual)
+    appstore_id_default = st.text_input("App ID (manuel)", value="", disabled=disable_app_manual)
+
+    def _effective_store(val_choice: str, val_manual: str) -> str:
+        if val_choice == "Manuel giriş":
+            return val_manual.strip()
+        if val_choice == "Yok (uygulanmaz)":
+            return ""
+        return val_choice
+
+    effective_pkg = _effective_store(pkg_choice, pkg_android_default)
+    effective_appid = _effective_store(appid_choice, appstore_id_default)
+
+    lang_country = st.selectbox("Dil/Ülke (Play & App Store)", ["tr/TR", "en/US"], index=0)
+    thr = st.slider("Eşleşme eşiği (fuzzy)", min_value=60, max_value=90, value=70, step=1)
+    use_all_rows = st.toggle("Tüm satırlarda çalıştır (işaretli değilse rastgele örneklem)")
